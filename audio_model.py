@@ -64,6 +64,55 @@ GROUPS = {
     "explosion": EXPLOSION_LABELS,
 }
 
+# ========= CALIBRATION / THRESHOLDS =========
+# Tune these numbers based on how your graphs look.
+
+CALIBRATION = {
+    # Screams are undersensitive -> boost
+    "vocal": {
+        "gain": 1.8,   # try 1.5–2.5
+        "bias": 0.0,
+    },
+    # Gunshots are undersensitive -> boost more
+    "gunshot": {
+        "gain": 10,   # try 2–3
+        "bias": 0.0,
+    },
+    # Alarms are oversensitive -> dampen
+    "alarm": {
+        "gain": 0.5,   # try 0.3–0.7
+        "bias": 0.0,
+    },
+    # Explosions somewhere in between
+    "explosion": {
+        "gain": 4.5,
+        "bias": 0.0,
+    },
+}
+
+# Detection / UI thresholds (you can tune later)
+THRESHOLDS = {
+    "vocal": 0.40,
+    "gunshot": 0.30,
+    "alarm": 0.50,
+    "explosion": 0.40,
+    "emergency": 0.50,
+}
+
+
+def apply_calibration(x: float, kind: str) -> float:
+    """
+    Apply per-class gain + bias, clamp into [0, 1].
+    x is usually a rolling score (0–1).
+    """
+    cfg = CALIBRATION.get(kind, {"gain": 1.0, "bias": 0.0})
+    y = cfg["gain"] * x + cfg["bias"]
+    if y < 0.0:
+        y = 0.0
+    if y > 1.0:
+        y = 1.0
+    return float(y)
+
 
 @dataclass
 class ClientState:
@@ -169,31 +218,50 @@ class StreamingAudioClassifier:
 
         probs = torch.sigmoid(logits)[0].cpu()  # multi-label probs
 
-        # Compute group scores
-        instant_scores = {}
+        # Compute group scores (instant)
+        instant_scores: Dict[str, float] = {}
         for group_name, labels in GROUPS.items():
             s = self._sum_labels(probs, labels)
             instant_scores[group_name] = s
             state.history[group_name].append(s)
 
-        # Rolling averages
-        rolling_scores = {}
+        # Rolling averages (raw)
+        rolling_raw: Dict[str, float] = {}
         for group_name, hist in state.history.items():
             if not hist:
-                rolling_scores[group_name] = 0.0
+                rolling_raw[group_name] = 0.0
             else:
                 recent = hist[-AGG_WINDOW_CHUNKS:]
-                rolling_scores[group_name] = float(sum(recent) / len(recent))
+                rolling_raw[group_name] = float(sum(recent) / len(recent))
 
-        # Aggregate emergency scores
+        # Apply calibration on rolling scores
+        rolling_calibrated: Dict[str, float] = {}
+        for group_name, raw_val in rolling_raw.items():
+            rolling_calibrated[group_name] = apply_calibration(raw_val, group_name)
+
+        # Aggregate emergency scores (raw + calibrated)
         emergency_instant = max(instant_scores.values()) if instant_scores else 0.0
-        emergency_rolling = max(rolling_scores.values()) if rolling_scores else 0.0
+        emergency_rolling_raw = max(rolling_raw.values()) if rolling_raw else 0.0
+        emergency_rolling_cal = max(
+            rolling_calibrated.values()) if rolling_calibrated else 0.0
 
         state.last_scores = {
+            # per-second raw probs from model
             "instant": instant_scores,
-            "rolling": rolling_scores,
+
+            # rolling averages BEFORE calibration (for debugging)
+            "rolling_raw": rolling_raw,
+
+            # rolling averages AFTER calibration (used by dashboard)
+            "rolling": rolling_calibrated,
+
             "emergency_instant": emergency_instant,
-            "emergency_rolling": emergency_rolling,
+            "emergency_rolling_raw": emergency_rolling_raw,
+            "emergency_rolling": emergency_rolling_cal,
+
+            # thresholds if UI ever wants to draw them
+            "thresholds": THRESHOLDS,
+
             "timestamp": time.time(),
         }
 
