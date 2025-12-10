@@ -2,16 +2,16 @@
 #
 # WebSocket server:
 # - Receives raw 16kHz mono 16-bit PCM from phone
-# - Buffers per client and saves ~10s WAV files to audio_recordings/
+# - Buffers per client and (optionally) saves ~10s WAV files to audio_recordings/
 # - Feeds the same PCM stream into StreamingAudioClassifier (audio_model.py)
 # - Exposes /scores endpoints for live confidence monitoring
+# - /dashboard shows live chart + alert status + alert history + log stream
 
 import os
 from datetime import datetime
-from fastapi.responses import HTMLResponse
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 
 from audio_model import classifier  # <-- our streaming classifier
 
@@ -89,19 +89,21 @@ async def audio_ws(websocket: WebSocket):
             # 1) Feed into streaming classifier
             scores = classifier.ingest_pcm(client_key, data)
             if scores is not None:
-                # Log the rolling emergency score; you could also send this to the client.
                 er = scores.get("emergency_rolling", 0.0)
-                print(f"[CLS] {client_key} emergency_rolling={er:.3f} "
+                overall = scores.get("overall_level", "none")
+                print(f"[CLS] {client_key} overall={overall} "
+                      f"emergency_rolling={er:.3f} "
                       f"rolling={scores.get('rolling')}")
 
-            # 2) Buffer for WAV saving (10 second chunks)
+            # 2) Buffer for WAV saving (10 second chunks) — optional
             buf = buffers[client_key]
             buf.extend(data)
             print(f"[BUFFER] {client_key} size={len(buf)} bytes (target={TARGET_BYTES})")
 
             if len(buf) >= TARGET_BYTES:
-                print(f"[SAVE] {client_key} reached ~10s of audio, saving WAV")
-                #save_buffer_as_wav(client_key, buf)
+                print(f"[SAVE] {client_key} reached ~10s of audio, clearing buffer")
+                # If you want to save, uncomment:
+                # save_buffer_as_wav(client_key, buf)
                 buf.clear()
 
                 # Optional: notify client that a clip was saved
@@ -114,9 +116,14 @@ async def audio_ws(websocket: WebSocket):
     finally:
         buffers.pop(client_key, None)
 
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
-    # Simple HTML page with Chart.js and polling of /scores
+    # HTML page with Chart.js, polling /scores and showing:
+    # - Rolling confidence lines
+    # - Current alert status
+    # - Alert history
+    # - Log stream (log_line from audio_model)
     return """
 <!DOCTYPE html>
 <html lang="en">
@@ -125,30 +132,97 @@ async def dashboard():
     <title>Audio Emergency Monitor</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
+        :root {
+            --bg: #020617;
+            --bg-elevated: #020617;
+            --bg-page: #020617;
+            --bg-alt: #0f172a;
+            --text: #e5e7eb;
+            --muted: #9ca3af;
+            --border-subtle: #1f2937;
+            --danger: #ef4444;
+            --warning: #f97316;
+            --ok: #22c55e;
+        }
+        * { box-sizing: border-box; }
         body {
             font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
             margin: 0;
             padding: 16px;
-            background: #111827;
-            color: #e5e7eb;
+            background: var(--bg-page);
+            color: var(--text);
         }
         h1 {
             margin-top: 0;
             font-size: 20px;
         }
+        #layout {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            grid-template-rows: auto 1fr;
+            grid-template-areas:
+              "main alerts"
+              "main logs";
+            gap: 16px;
+        }
+        #main-panel { grid-area: main; }
+        #alerts-panel { grid-area: alerts; }
+        #logs-panel { grid-area: logs; }
+
         #top-bar {
             display: flex;
             align-items: center;
             gap: 12px;
-            margin-bottom: 16px;
+            margin-bottom: 8px;
+            flex-wrap: wrap;
         }
         #client-id {
             font-weight: 600;
             color: #a5b4fc;
         }
         #status {
-            font-size: 14px;
+            font-size: 13px;
+            color: var(--muted);
         }
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 3px 8px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+        }
+        .badge-none {
+            background: rgba(148, 163, 184, 0.15);
+            color: var(--muted);
+        }
+        .badge-potential {
+            background: rgba(249, 115, 22, 0.12);
+            color: var(--warning);
+        }
+        .badge-emergency {
+            background: rgba(239, 68, 68, 0.12);
+            color: var(--danger);
+            box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.4);
+        }
+
+        #alert-banner {
+            margin-top: 8px;
+            padding: 8px 10px;
+            border-radius: 8px;
+            border: 1px solid rgba(239, 68, 68, 0.5);
+            background: rgba(127, 29, 29, 0.8);
+            color: #fee2e2;
+            font-size: 13px;
+            display: none;
+        }
+        #alert-banner strong {
+            margin-right: 6px;
+        }
+
         #scores-panel {
             margin-top: 12px;
             font-size: 14px;
@@ -157,55 +231,194 @@ async def dashboard():
             gap: 12px;
         }
         .score-box {
-            background: #020617;
+            background: var(--bg-elevated);
             border-radius: 8px;
             padding: 8px 10px;
-            min-width: 120px;
+            min-width: 140px;
+            border: 1px solid var(--border-subtle);
         }
         .score-label {
-            font-size: 12px;
+            font-size: 11px;
             text-transform: uppercase;
-            color: #9ca3af;
+            color: var(--muted);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
         }
         .score-value {
             font-size: 16px;
             font-weight: 600;
+            margin-top: 2px;
         }
+        .score-level {
+            font-size: 11px;
+            padding: 1px 6px;
+            border-radius: 999px;
+            border: 1px solid transparent;
+        }
+        .level-none {
+            color: var(--muted);
+            border-color: transparent;
+        }
+        .level-potential {
+            color: var(--warning);
+            border-color: rgba(249, 115, 22, 0.4);
+        }
+        .level-emergency {
+            color: var(--danger);
+            border-color: rgba(239, 68, 68, 0.6);
+        }
+
         canvas {
-            background: #020617;
+            background: var(--bg-elevated);
             border-radius: 12px;
             padding: 12px;
+            border: 1px solid var(--border-subtle);
+        }
+
+        /* Alerts column */
+        .panel {
+            background: var(--bg-alt);
+            border-radius: 12px;
+            border: 1px solid var(--border-subtle);
+            padding: 10px 12px;
+            font-size: 13px;
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+        }
+        .panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 6px;
+        }
+        .panel-title {
+            font-size: 13px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            color: var(--muted);
+        }
+        .panel-body {
+            overflow-y: auto;
+            max-height: 260px;
+            padding-right: 4px;
+        }
+        .history-item {
+            padding: 6px 4px;
+            border-bottom: 1px solid rgba(31, 41, 55, 0.7);
+        }
+        .history-item:last-child {
+            border-bottom: none;
+        }
+        .history-meta {
+            font-size: 11px;
+            color: var(--muted);
+            margin-bottom: 2px;
+        }
+        .history-main {
+            font-size: 13px;
+        }
+
+        /* Log panel */
+        #logs-list {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            font-size: 11px;
+            color: #e5e7eb;
+        }
+        .log-line {
+            padding: 3px 0;
+            border-bottom: 1px solid rgba(31, 41, 55, 0.7);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        @media (max-width: 900px) {
+            #layout {
+                grid-template-columns: 1fr;
+                grid-template-areas:
+                  "main"
+                  "alerts"
+                  "logs";
+            }
         }
     </style>
 </head>
 <body>
     <h1>Audio Emergency Monitor</h1>
-    <div id="top-bar">
-        <div>Active client: <span id="client-id">none</span></div>
-        <div id="status">Waiting for scores...</div>
-    </div>
-    <canvas id="chart" height="120"></canvas>
+    <div id="layout">
+        <div id="main-panel">
+            <div id="top-bar">
+                <div>Active client: <span id="client-id">none</span></div>
+                <div id="status">Waiting for scores...</div>
+                <div id="overall-badge" class="badge badge-none">No signal</div>
+            </div>
+            <div id="alert-banner">
+                <strong>🚨 Emergency detected</strong>
+                <span id="alert-banner-text"></span>
+            </div>
 
-    <div id="scores-panel">
-        <div class="score-box">
-            <div class="score-label">Vocal distress</div>
-            <div class="score-value" id="vocal-score">0.00</div>
+            <canvas id="chart" height="120"></canvas>
+
+            <div id="scores-panel">
+                <div class="score-box">
+                    <div class="score-label">
+                        <span>Vocal distress</span>
+                        <span id="vocal-level" class="score-level level-none">none</span>
+                    </div>
+                    <div class="score-value" id="vocal-score">0.00</div>
+                </div>
+                <div class="score-box">
+                    <div class="score-label">
+                        <span>Gunshot</span>
+                        <span id="gunshot-level" class="score-level level-none">none</span>
+                    </div>
+                    <div class="score-value" id="gunshot-score">0.00</div>
+                </div>
+                <div class="score-box">
+                    <div class="score-label">
+                        <span>Alarm</span>
+                        <span id="alarm-level" class="score-level level-none">none</span>
+                    </div>
+                    <div class="score-value" id="alarm-score">0.00</div>
+                </div>
+                <div class="score-box">
+                    <div class="score-label">
+                        <span>Explosion</span>
+                        <span id="explosion-level" class="score-level level-none">none</span>
+                    </div>
+                    <div class="score-value" id="explosion-score">0.00</div>
+                </div>
+                <div class="score-box">
+                    <div class="score-label">
+                        <span>Emergency (rolling max)</span>
+                        <span class="score-level level-none" id="emergency-level-small">none</span>
+                    </div>
+                    <div class="score-value" id="emergency-score">0.00</div>
+                </div>
+            </div>
         </div>
-        <div class="score-box">
-            <div class="score-label">Gunshot</div>
-            <div class="score-value" id="gunshot-score">0.00</div>
+
+        <div id="alerts-panel" class="panel">
+            <div class="panel-header">
+                <div class="panel-title">Alert history</div>
+                <div id="alerts-count" style="font-size:11px;color:var(--muted);">0</div>
+            </div>
+            <div class="panel-body" id="alerts-list">
+                <!-- alerts go here -->
+            </div>
         </div>
-        <div class="score-box">
-            <div class="score-label">Alarm</div>
-            <div class="score-value" id="alarm-score">0.00</div>
-        </div>
-        <div class="score-box">
-            <div class="score-label">Explosion</div>
-            <div class="score-value" id="explosion-score">0.00</div>
-        </div>
-        <div class="score-box">
-            <div class="score-label">Emergency (rolling max)</div>
-            <div class="score-value" id="emergency-score">0.00</div>
+
+        <div id="logs-panel" class="panel">
+            <div class="panel-header">
+                <div class="panel-title">Model log</div>
+                <div style="font-size:11px;color:var(--muted);">Newest first</div>
+            </div>
+            <div class="panel-body" id="logs-list">
+                <!-- log lines go here -->
+            </div>
         </div>
     </div>
 
@@ -253,6 +466,12 @@ async def dashboard():
             }
         };
 
+        // Alert + log state
+        let lastOverallLevel = "none";
+        let lastLogTimestamp = 0;
+        const MAX_ALERTS = 50;
+        const MAX_LOGS = 200;
+
         function initChart() {
             const ctx = document.getElementById('chart').getContext('2d');
             chart = new Chart(ctx, {
@@ -286,7 +505,7 @@ async def dashboard():
                             },
                             title: {
                                 display: true,
-                                text: 'Time (seconds)',
+                                text: 'Time (windows)',
                                 color: '#9ca3af',
                                 font: { size: 11 }
                             },
@@ -316,6 +535,117 @@ async def dashboard():
             });
         }
 
+        function setOverallBadge(level) {
+            const badge = document.getElementById('overall-badge');
+            badge.className = 'badge'; // reset
+            let text = '';
+
+            if (level === 'emergency') {
+                badge.classList.add('badge-emergency');
+                text = 'Emergency';
+            } else if (level === 'potential') {
+                badge.classList.add('badge-potential');
+                text = 'Potential risk';
+            } else {
+                badge.classList.add('badge-none');
+                text = 'No emergency detected';
+            }
+
+            badge.textContent = text;
+        }
+
+        function setLevelChip(elemId, level) {
+            const el = document.getElementById(elemId);
+            el.className = 'score-level';
+            if (level === 'emergency') {
+                el.classList.add('level-emergency');
+            } else if (level === 'potential') {
+                el.classList.add('level-potential');
+            } else {
+                el.classList.add('level-none');
+            }
+            el.textContent = level;
+        }
+
+        function showAlertBanner(text) {
+            const banner = document.getElementById('alert-banner');
+            const span = document.getElementById('alert-banner-text');
+            span.textContent = text || '';
+            banner.style.display = 'block';
+
+            // Auto-fade after 6 seconds
+            setTimeout(() => {
+                banner.style.display = 'none';
+            }, 6000);
+        }
+
+        function addAlertHistoryEntry(clientId, scores) {
+            const scoresRolling = scores.rolling || {};
+            const levels = scores.per_group_level || {};
+            const ts = scores.timestamp || Date.now() / 1000;
+            const date = new Date(ts * 1000);
+            const tsStr = date.toLocaleTimeString([], { hour12: false });
+
+            const v = (scoresRolling.vocal || 0).toFixed(3);
+            const g = (scoresRolling.gunshot || 0).toFixed(3);
+            const a = (scoresRolling.alarm || 0).toFixed(3);
+            const e = (scoresRolling.explosion || 0).toFixed(3);
+
+            const overall = scores.overall_level || 'emergency';
+
+            const item = document.createElement('div');
+            item.className = 'history-item';
+
+            item.innerHTML = `
+                <div class="history-meta">
+                    <span>${tsStr}</span>
+                    <span style="margin-left:6px;color:#a5b4fc;">${clientId}</span>
+                    <span style="margin-left:6px;">level: <strong>${overall}</strong></span>
+                </div>
+                <div class="history-main">
+                    vocal=${v} (${levels.vocal || 'none'}),
+                    gunshot=${g} (${levels.gunshot || 'none'}),
+                    alarm=${a} (${levels.alarm || 'none'}),
+                    explosion=${e} (${levels.explosion || 'none'})
+                </div>
+            `;
+
+            const list = document.getElementById('alerts-list');
+            // Newest on top
+            list.insertBefore(item, list.firstChild);
+
+            // Trim
+            while (list.children.length > MAX_ALERTS) {
+                list.removeChild(list.lastChild);
+            }
+
+            document.getElementById('alerts-count').textContent =
+                list.children.length.toString();
+        }
+
+        function addLogLine(scores) {
+            const logLine = scores.log_line;
+            const ts = scores.timestamp || Date.now() / 1000;
+            const list = document.getElementById('logs-list');
+
+            if (!logLine) return;
+
+            // Avoid duplicates by timestamp
+            if (ts <= lastLogTimestamp) return;
+            lastLogTimestamp = ts;
+
+            const div = document.createElement('div');
+            div.className = 'log-line';
+            div.textContent = logLine;
+
+            // Newest first
+            list.insertBefore(div, list.firstChild);
+
+            while (list.children.length > MAX_LOGS) {
+                list.removeChild(list.lastChild);
+            }
+        }
+
         async function pollScores() {
             try {
                 const res = await fetch('/scores');
@@ -329,19 +659,26 @@ async def dashboard():
                 if (clientIds.length === 0) {
                     document.getElementById('client-id').textContent = 'none';
                     document.getElementById('status').textContent = 'No active streams yet...';
+                    setOverallBadge('none');
                     return;
                 }
 
                 // For now: just take the first client
                 const clientId = clientIds[0];
+                const scores = data[clientId];
+
                 document.getElementById('client-id').textContent = clientId;
                 document.getElementById('status').textContent = 'Receiving live scores';
 
-                const scores = data[clientId];
                 const rolling = scores.rolling || {};
                 const emergencyRolling = scores.emergency_rolling || 0.0;
+                const perGroupLevel = scores.per_group_level || {};
+                const overallLevel = scores.overall_level || 'none';
 
-                // Update numeric display
+                // Update overall badge
+                setOverallBadge(overallLevel);
+
+                // Update numeric display + per-group severity chips
                 const v = rolling.vocal || 0.0;
                 const g = rolling.gunshot || 0.0;
                 const a = rolling.alarm || 0.0;
@@ -353,7 +690,13 @@ async def dashboard():
                 document.getElementById('explosion-score').textContent = e.toFixed(3);
                 document.getElementById('emergency-score').textContent = emergencyRolling.toFixed(3);
 
-                // Append new point
+                setLevelChip('vocal-level', perGroupLevel.vocal || 'none');
+                setLevelChip('gunshot-level', perGroupLevel.gunshot || 'none');
+                setLevelChip('alarm-level', perGroupLevel.alarm || 'none');
+                setLevelChip('explosion-level', perGroupLevel.explosion || 'none');
+                setLevelChip('emergency-level-small', overallLevel);
+
+                // Append new point to chart
                 const t = labels.length > 0 ? labels[labels.length - 1] + 1 : 0;
                 labels.push(t);
                 datasets.vocal.data.push(v);
@@ -362,7 +705,6 @@ async def dashboard():
                 datasets.explosion.data.push(e);
                 datasets.emergency.data.push(emergencyRolling);
 
-                // Keep only last MAX_POINTS
                 if (labels.length > MAX_POINTS) {
                     labels.shift();
                     Object.values(datasets).forEach(ds => ds.data.shift());
@@ -371,21 +713,40 @@ async def dashboard():
                 chart.data.labels = labels;
                 chart.update('none');
 
+                // Log line
+                addLogLine(scores);
+
+                // ALERT logic: trigger when we *enter* emergency
+                if (lastOverallLevel !== 'emergency' && overallLevel === 'emergency') {
+                    const top = scores.top_labels || [];
+                    const topText = top
+                        .slice(0, 3)
+                        .map(t => `${t.label}:${t.prob.toFixed(2)}`)
+                        .join(', ');
+
+                    showAlertBanner(topText || 'High emergency confidence');
+
+                    addAlertHistoryEntry(clientId, scores);
+                }
+                lastOverallLevel = overallLevel;
+
             } catch (err) {
                 console.error('Error in pollScores:', err);
                 document.getElementById('status').textContent = 'Error talking to server';
+                setOverallBadge('none');
             }
         }
 
         window.addEventListener('load', () => {
             initChart();
-            // Poll once per second; you can lower to 500ms, but model updates are 1s anyway
+            // Poll once per second; model updates once per audio window
             setInterval(pollScores, 1000);
         });
     </script>
 </body>
 </html>
     """
+
 
 def save_buffer_as_wav(client_key: str, buffer: bytearray):
     pcm_bytes = bytes(buffer)

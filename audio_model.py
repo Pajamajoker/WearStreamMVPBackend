@@ -2,7 +2,8 @@
 #
 # Streaming wrapper around MIT/ast-finetuned-audioset-16-16-0.442
 # Takes raw 16kHz mono 16-bit PCM chunks, keeps a per-client buffer,
-# runs 1-second windows through AST, and maintains rolling scores.
+# uses a multi-second context window for the model, and maintains
+# rolling scores + human-readable logs.
 
 import time
 from dataclasses import dataclass, field
@@ -14,9 +15,16 @@ from transformers import AutoProcessor, AutoModelForAudioClassification
 
 # ---- Audio + window config (must match your pipeline) ----
 TARGET_SR = 16000          # Hz
-WINDOW_SEC = 1             # length of each classification window
+WINDOW_SEC = 1             # how often we advance the stream (seconds)
 BYTES_PER_SAMPLE = 2       # int16 = 2 bytes
 BYTES_PER_SECOND = TARGET_SR * BYTES_PER_SAMPLE  # mono
+
+# We still step the stream in 1s chunks, but the model
+# will see the *last CONTEXT_SEC seconds* of audio.
+CONTEXT_SEC = 3            # length of context passed to model
+CONTEXT_BYTES = CONTEXT_SEC * BYTES_PER_SECOND
+
+# Rolling aggregation over last N windows (seconds)
 AGG_WINDOW_CHUNKS = 4      # rolling average over last N seconds
 
 # ---- Model config ----
@@ -65,22 +73,22 @@ GROUPS = {
 }
 
 # ========= CALIBRATION / THRESHOLDS =========
-# Tune these numbers based on how your graphs look.
+# Your tuned gains (can be adjusted further)
 
 CALIBRATION = {
     # Screams are undersensitive -> boost
     "vocal": {
-        "gain": 1.8,   # try 1.5–2.5
+        "gain": 2,
         "bias": 0.0,
     },
     # Gunshots are undersensitive -> boost more
     "gunshot": {
-        "gain": 10,   # try 2–3
+        "gain": 10.0,
         "bias": 0.0,
     },
-    # Alarms are oversensitive -> dampen
+    # Alarms oversensitive -> you had 0.5 before, let's keep closer to 1
     "alarm": {
-        "gain": 0.5,   # try 0.3–0.7
+        "gain": 1.0,
         "bias": 0.0,
     },
     # Explosions somewhere in between
@@ -90,14 +98,25 @@ CALIBRATION = {
     },
 }
 
-# Detection / UI thresholds (you can tune later)
+# Detection / UI thresholds (per-group "emergency" level)
 THRESHOLDS = {
     "vocal": 0.40,
     "gunshot": 0.30,
     "alarm": 0.50,
     "explosion": 0.40,
-    "emergency": 0.50,
+    "emergency": 0.50,  # global overall emergency threshold (for future use)
 }
+
+# We derive "potential" = 0.5 * emergency threshold per group
+SEVERITY_ORDER = {"none": 0, "potential": 1, "emergency": 2}
+
+
+def clamp01(x: float) -> float:
+    if x < 0.0:
+        return 0.0
+    if x > 1.0:
+        return 1.0
+    return float(x)
 
 
 def apply_calibration(x: float, kind: str) -> float:
@@ -107,20 +126,45 @@ def apply_calibration(x: float, kind: str) -> float:
     """
     cfg = CALIBRATION.get(kind, {"gain": 1.0, "bias": 0.0})
     y = cfg["gain"] * x + cfg["bias"]
-    if y < 0.0:
-        y = 0.0
-    if y > 1.0:
-        y = 1.0
-    return float(y)
+    return clamp01(y)
+
+
+def classify_severity(score: float, group: str) -> str:
+    """
+    Map a final rolling score into: none / potential / emergency
+    using group-specific thresholds from THRESHOLDS.
+    """
+    em_thr = THRESHOLDS.get(group, 0.5)
+    pot_thr = 0.5 * em_thr
+
+    if score >= em_thr:
+        return "emergency"
+    elif score >= pot_thr:
+        return "potential"
+    else:
+        return "none"
+
+
+def format_ts(ts: float) -> str:
+    """Return an ISO-ish timestamp string."""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
 
 
 @dataclass
 class ClientState:
     """Keeps streaming state for a single client."""
+    # Raw 1s step buffer (used only to decide when to process)
     pcm_buffer: bytearray = field(default_factory=bytearray)
+
+    # Rolling context buffer of last CONTEXT_SEC seconds (for model input)
+    pcm_context: bytearray = field(default_factory=bytearray)
+
+    # History of raw per-second group scores (before calibration)
     history: Dict[str, List[float]] = field(
         default_factory=lambda: {g: [] for g in GROUPS.keys()}
     )
+
+    # Last computed scores + log info
     last_scores: Optional[dict] = None
 
 
@@ -149,6 +193,12 @@ class StreamingAudioClassifier:
         self.id2label = self.model.config.id2label
         self.label2id = {v: k for k, v in self.id2label.items()}
 
+        # Reverse mapping: AudioSet label -> list of our groups
+        self.label_to_groups: Dict[str, List[str]] = {}
+        for group_name, labels in GROUPS.items():
+            for lab in labels:
+                self.label_to_groups.setdefault(lab, []).append(group_name)
+
         # Per-client state
         self.clients: Dict[str, ClientState] = {}
 
@@ -169,8 +219,8 @@ class StreamingAudioClassifier:
 
         state.pcm_buffer.extend(pcm_bytes)
 
-        # Process as many full 1-second windows as we have.
         updated = False
+        # Process as many full 1-second windows as we have.
         while len(state.pcm_buffer) >= BYTES_PER_SECOND:
             window_bytes = state.pcm_buffer[:BYTES_PER_SECOND]
             del state.pcm_buffer[:BYTES_PER_SECOND]
@@ -197,35 +247,64 @@ class StreamingAudioClassifier:
 
     def _process_window(self, state: ClientState, window_bytes: bytes) -> None:
         """
-        Run one 1-second window through the model and update scores.
+        Advance stream by 1 second:
+        - update context buffer (last CONTEXT_SEC seconds)
+        - run model on that multi-second context
+        - update rolling + severity + log.
         """
-        # PCM int16 LE -> float32 in [-1, 1]
-        samples = np.frombuffer(window_bytes, dtype="<i2").astype("float32") / 32768.0
+        # 1) Update context (last CONTEXT_SEC seconds)
+        state.pcm_context.extend(window_bytes)
+        if len(state.pcm_context) > CONTEXT_BYTES:
+            # keep only the last CONTEXT_BYTES
+            state.pcm_context = state.pcm_context[-CONTEXT_BYTES:]
+
+        # Use full context for model; if we are at the very beginning,
+        # we may have less than CONTEXT_SEC seconds -> that's fine.
+        context_bytes = state.pcm_context if state.pcm_context else window_bytes
+        context_sec = len(context_bytes) / BYTES_PER_SECOND
+
+        # 2) PCM int16 LE -> float32 in [-1, 1]
+        samples = np.frombuffer(context_bytes, dtype="<i2").astype("float32") / 32768.0
         waveform = torch.from_numpy(samples)  # shape [time]
 
-        # AST processor expects mono waveform
+        # 3) AST processor expects mono waveform
         inputs = self.processor(
             waveform,
             sampling_rate=TARGET_SR,
-            return_tensors="pt"
+            return_tensors="pt",
         )
 
         # Move tensors to device
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
+        # 4) Forward pass
         with torch.no_grad():
             logits = self.model(**inputs).logits
 
-        probs = torch.sigmoid(logits)[0].cpu()  # multi-label probs
+        probs = torch.sigmoid(logits)[0].cpu()  # multi-label probs, shape [num_labels]
 
-        # Compute group scores (instant)
+        # 5) Top-k model labels (true AudioSet labels)
+        TOP_K = 5
+        top_indices = probs.topk(TOP_K).indices.tolist()
+        top_labels = []
+        for idx in top_indices:
+            label = self.id2label[idx]
+            p = float(probs[idx])
+            mapped_groups = self.label_to_groups.get(label, [])
+            top_labels.append({
+                "label": label,
+                "prob": p,
+                "groups": mapped_groups,
+            })
+
+        # 6) Per-group instant scores (sum of relevant AudioSet probs)
         instant_scores: Dict[str, float] = {}
         for group_name, labels in GROUPS.items():
             s = self._sum_labels(probs, labels)
             instant_scores[group_name] = s
             state.history[group_name].append(s)
 
-        # Rolling averages (raw)
+        # 7) Rolling averages (raw, over last AGG_WINDOW_CHUNKS seconds)
         rolling_raw: Dict[str, float] = {}
         for group_name, hist in state.history.items():
             if not hist:
@@ -234,35 +313,88 @@ class StreamingAudioClassifier:
                 recent = hist[-AGG_WINDOW_CHUNKS:]
                 rolling_raw[group_name] = float(sum(recent) / len(recent))
 
-        # Apply calibration on rolling scores
+        # 8) Apply calibration on rolling scores
         rolling_calibrated: Dict[str, float] = {}
         for group_name, raw_val in rolling_raw.items():
             rolling_calibrated[group_name] = apply_calibration(raw_val, group_name)
 
-        # Aggregate emergency scores (raw + calibrated)
+        # For now, our FINAL scores are the calibrated ones (no extra trend/corr)
+        rolling_final: Dict[str, float] = dict(rolling_calibrated)
+
+        # 9) Per-group severity classification
+        per_group_level: Dict[str, str] = {}
+        overall_level = "none"
+        for group_name, score in rolling_final.items():
+            level = classify_severity(score, group_name)
+            per_group_level[group_name] = level
+            if SEVERITY_ORDER[level] > SEVERITY_ORDER[overall_level]:
+                overall_level = level
+
+        # 10) Emergency aggregates
         emergency_instant = max(instant_scores.values()) if instant_scores else 0.0
         emergency_rolling_raw = max(rolling_raw.values()) if rolling_raw else 0.0
-        emergency_rolling_cal = max(
-            rolling_calibrated.values()) if rolling_calibrated else 0.0
+        emergency_rolling_final = max(
+            rolling_final.values()
+        ) if rolling_final else 0.0
 
+        ts = time.time()
+
+        # 11) Build a nice log line for dashboard / debugging
+        def fmt_score(name: str) -> str:
+            s = rolling_final.get(name, 0.0)
+            lvl = per_group_level.get(name, "none")
+            return f"{name}={s:.3f}({lvl})"
+
+        parts = [
+            f"[{format_ts(ts)}]",
+            f"ctx={context_sec:.1f}s",
+            fmt_score("vocal"),
+            fmt_score("gunshot"),
+            fmt_score("alarm"),
+            fmt_score("explosion"),
+            f"overall={overall_level}",
+        ]
+
+        top_str = ", ".join(
+            f"{t['label']}:{t['prob']:.3f}"
+            for t in top_labels
+        )
+        parts.append(f"top=[{top_str}]")
+
+        log_line = " | ".join(parts)
+
+        # 12) Store everything in last_scores (what /metrics and WS server can expose)
         state.last_scores = {
-            # per-second raw probs from model
+            # raw per-second group probs from model
             "instant": instant_scores,
 
             # rolling averages BEFORE calibration (for debugging)
             "rolling_raw": rolling_raw,
 
-            # rolling averages AFTER calibration (used by dashboard)
-            "rolling": rolling_calibrated,
+            # rolling AFTER calibration (used by plots + severity)
+            "rolling": rolling_final,
 
+            # top-k AudioSet labels
+            "top_labels": top_labels,
+
+            # per-group and overall severity levels
+            "per_group_level": per_group_level,
+            "overall_level": overall_level,
+
+            # aggregate emergency scores
             "emergency_instant": emergency_instant,
             "emergency_rolling_raw": emergency_rolling_raw,
-            "emergency_rolling": emergency_rolling_cal,
+            "emergency_rolling": emergency_rolling_final,
 
-            # thresholds if UI ever wants to draw them
+            # thresholds (so UI can draw horizontal lines etc.)
             "thresholds": THRESHOLDS,
 
-            "timestamp": time.time(),
+            # how much context the model actually saw here
+            "context_seconds": context_sec,
+
+            # timestamp + human-readable log
+            "timestamp": ts,
+            "log_line": log_line,
         }
 
     def _sum_labels(self, probs: torch.Tensor, labels: List[str]) -> float:
