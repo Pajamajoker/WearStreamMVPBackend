@@ -4,16 +4,18 @@
 # - Receives raw 16kHz mono 16-bit PCM from phone
 # - Buffers per client and (optionally) saves ~10s WAV files to audio_recordings/
 # - Feeds the same PCM stream into StreamingAudioClassifier (audio_model.py)
-# - Exposes /scores endpoints for live confidence monitoring
-# - /dashboard shows live chart + alert status + alert history + log stream
+# - Exposes /scores for live confidence monitoring
+# - Exposes /alerts and pushes alert events over WS when emergency level changes
+# - Serves a dashboard with rolling charts + alert history
 
+import json
 import os
 from datetime import datetime
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
 
-from audio_model import classifier  # <-- our streaming classifier
+from audio_model import classifier, THRESHOLDS  # <-- streaming classifier + thresholds
 
 app = FastAPI()
 
@@ -34,10 +36,18 @@ os.makedirs(RECORDINGS_DIR, exist_ok=True)
 # In-memory buffers per client for WAV saving
 buffers = {}  # key: client id, value: bytearray
 
+# ---- Alert tracking ----
+ALERT_LOG = []      # list of alert events (dicts)
+MAX_ALERTS = 200    # keep last N alerts in memory
+LAST_LEVEL = {}     # per-client last overall level
+
+EMERGENCY_THRESH = THRESHOLDS.get("emergency", 0.5)
+WARNING_THRESH = 0.35  # you can tune this
+
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "WS audio server with streaming classifier"}
+    return {"status": "ok", "message": "WS audio server with streaming classifier + alerts"}
 
 
 @app.get("/debug")
@@ -46,6 +56,7 @@ async def debug():
         "active_buffers": {k: len(v) for k, v in buffers.items()},
         "target_bytes": TARGET_BYTES,
         "classifier_clients": list(classifier.clients.keys()),
+        "alerts_count": len(ALERT_LOG),
     })
 
 
@@ -68,15 +79,94 @@ async def get_scores(client_id: str):
     return scores
 
 
+@app.get("/alerts")
+async def get_alerts():
+    """
+    Get alert history (for dashboard polling).
+    """
+    return {"alerts": ALERT_LOG}
+
+
+def classify_level(emergency_rolling: float) -> str:
+    """
+    Map emergency_rolling into high-level state.
+    """
+    if emergency_rolling >= EMERGENCY_THRESH:
+        return "emergency"
+    if emergency_rolling >= WARNING_THRESH:
+        return "warning"
+    return "normal"
+
+
+def make_alert_event(client_id: str, scores: dict, level: str) -> dict:
+    """
+    Build a rich alert event dict from the current scores.
+    """
+    ts = datetime.utcnow().isoformat() + "Z"
+    rolling = scores.get("rolling", {}) or {}
+    rolling_raw = scores.get("rolling_raw", {}) or {}
+    emergency_rolling = scores.get("emergency_rolling", 0.0)
+
+    # Top groups by calibrated rolling score
+    sorted_groups = sorted(
+        rolling.items(), key=lambda kv: kv[1], reverse=True
+    )
+    top_groups = sorted_groups[:3]
+
+    # Top model labels & mapped labels if audio_model is providing them
+    top_model_labels = scores.get("top_model_labels", [])
+    top_group_labels = scores.get("top_group_labels", [])
+
+    primary_group = top_groups[0][0] if top_groups else "unknown"
+    primary_score = top_groups[0][1] if top_groups else emergency_rolling
+
+    msg = f"{level.upper()} event: {primary_group}={primary_score:.2f}"
+
+    if top_group_labels:
+        msg += " | mapped: " + ", ".join(
+            f"{g}:{v:.2f}" for g, v in top_group_labels[:3]
+        )
+    if top_model_labels:
+        names = [lab for (lab, _) in top_model_labels[:3]]
+        msg += " | model: " + ", ".join(names)
+
+    event = {
+        "timestamp": ts,
+        "client_id": client_id,
+        "level": level,
+        "emergency_rolling": emergency_rolling,
+        "rolling": rolling,
+        "rolling_raw": rolling_raw,
+        "top_groups": top_groups,
+        "top_model_labels": top_model_labels,
+        "top_group_labels": top_group_labels,
+        "message": msg,
+    }
+    return event
+
+
+def record_alert(event: dict):
+    """
+    Append alert event into in-memory log (bounded).
+    """
+    ALERT_LOG.append(event)
+    if len(ALERT_LOG) > MAX_ALERTS:
+        del ALERT_LOG[0:len(ALERT_LOG) - MAX_ALERTS]
+
+
 @app.websocket("/ws")
 async def audio_ws(websocket: WebSocket):
     """
     Simple WebSocket endpoint at /ws.
     Each connection is treated as a separate client stream.
+    - Receives raw PCM bytes from phone
+    - Feeds into classifier
+    - Tracks emergency level transitions and pushes alert JSON to the phone.
     """
     await websocket.accept()
     client_key = f"client_{id(websocket)}"
     buffers[client_key] = bytearray()
+    LAST_LEVEL[client_key] = "normal"
 
     print(f"[WS OPEN] {client_key}")
 
@@ -90,24 +180,45 @@ async def audio_ws(websocket: WebSocket):
             scores = classifier.ingest_pcm(client_key, data)
             if scores is not None:
                 er = scores.get("emergency_rolling", 0.0)
-                overall = scores.get("overall_level", "none")
-                print(f"[CLS] {client_key} overall={overall} "
-                      f"emergency_rolling={er:.3f} "
-                      f"rolling={scores.get('rolling')}")
+                level = classify_level(er)
+                prev_level = LAST_LEVEL.get(client_key, "normal")
+                LAST_LEVEL[client_key] = level
 
-            # 2) Buffer for WAV saving (10 second chunks) — optional
+                print(
+                    f"[CLS] {client_key} level={level} "
+                    f"emergency_rolling={er:.3f} rolling={scores.get('rolling')}"
+                )
+
+                # If level changed into warning/emergency, emit alert event.
+                if level in ("warning", "emergency") and level != prev_level:
+                    event = make_alert_event(client_key, scores, level)
+                    record_alert(event)
+                    payload = {
+                        "type": "alert",
+                        "event": event,
+                    }
+                    try:
+                        await websocket.send_text(json.dumps(payload))
+                        print(f"[ALERT] Sent alert to {client_key}: {event['message']}")
+                    except Exception as e:
+                        print(f"[ALERT ERROR] Failed to send alert to {client_key}: {e}")
+
+            # 2) Buffer for WAV saving (10 second chunks) – optional
             buf = buffers[client_key]
             buf.extend(data)
-            print(f"[BUFFER] {client_key} size={len(buf)} bytes (target={TARGET_BYTES})")
+            print(
+                f"[BUFFER] {client_key} size={len(buf)} bytes "
+                f"(target={TARGET_BYTES})"
+            )
 
             if len(buf) >= TARGET_BYTES:
                 print(f"[SAVE] {client_key} reached ~10s of audio, clearing buffer")
-                # If you want to save, uncomment:
+                # If you want to save WAVs, uncomment:
                 # save_buffer_as_wav(client_key, buf)
                 buf.clear()
 
                 # Optional: notify client that a clip was saved
-                await websocket.send_text("saved_10s_clip")
+                # await websocket.send_text("saved_10s_clip")
 
     except WebSocketDisconnect:
         print(f"[WS CLOSE] {client_key}")
@@ -115,15 +226,12 @@ async def audio_ws(websocket: WebSocket):
         print(f"[WS ERROR] {client_key}: {e}")
     finally:
         buffers.pop(client_key, None)
+        LAST_LEVEL.pop(client_key, None)
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
-    # HTML page with Chart.js, polling /scores and showing:
-    # - Rolling confidence lines
-    # - Current alert status
-    # - Alert history
-    # - Log stream (log_line from audio_model)
+    # HTML page with Chart.js and polling of /scores + /alerts
     return """
 <!DOCTYPE html>
 <html lang="en">
@@ -132,25 +240,12 @@ async def dashboard():
     <title>Audio Emergency Monitor</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        :root {
-            --bg: #020617;
-            --bg-elevated: #020617;
-            --bg-page: #020617;
-            --bg-alt: #0f172a;
-            --text: #e5e7eb;
-            --muted: #9ca3af;
-            --border-subtle: #1f2937;
-            --danger: #ef4444;
-            --warning: #f97316;
-            --ok: #22c55e;
-        }
-        * { box-sizing: border-box; }
         body {
             font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
             margin: 0;
             padding: 16px;
-            background: var(--bg-page);
-            color: var(--text);
+            background: #020617;
+            color: #e5e7eb;
         }
         h1 {
             margin-top: 0;
@@ -159,70 +254,22 @@ async def dashboard():
         #layout {
             display: grid;
             grid-template-columns: 2fr 1fr;
-            grid-template-rows: auto 1fr;
-            grid-template-areas:
-              "main alerts"
-              "main logs";
             gap: 16px;
+            align-items: flex-start;
         }
-        #main-panel { grid-area: main; }
-        #alerts-panel { grid-area: alerts; }
-        #logs-panel { grid-area: logs; }
-
         #top-bar {
             display: flex;
             align-items: center;
             gap: 12px;
-            margin-bottom: 8px;
-            flex-wrap: wrap;
+            margin-bottom: 12px;
         }
         #client-id {
             font-weight: 600;
             color: #a5b4fc;
         }
         #status {
-            font-size: 13px;
-            color: var(--muted);
+            font-size: 14px;
         }
-
-        .badge {
-            display: inline-flex;
-            align-items: center;
-            padding: 3px 8px;
-            border-radius: 999px;
-            font-size: 12px;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.03em;
-        }
-        .badge-none {
-            background: rgba(148, 163, 184, 0.15);
-            color: var(--muted);
-        }
-        .badge-potential {
-            background: rgba(249, 115, 22, 0.12);
-            color: var(--warning);
-        }
-        .badge-emergency {
-            background: rgba(239, 68, 68, 0.12);
-            color: var(--danger);
-            box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.4);
-        }
-
-        #alert-banner {
-            margin-top: 8px;
-            padding: 8px 10px;
-            border-radius: 8px;
-            border: 1px solid rgba(239, 68, 68, 0.5);
-            background: rgba(127, 29, 29, 0.8);
-            color: #fee2e2;
-            font-size: 13px;
-            display: none;
-        }
-        #alert-banner strong {
-            margin-right: 6px;
-        }
-
         #scores-panel {
             margin-top: 12px;
             font-size: 14px;
@@ -231,194 +278,132 @@ async def dashboard():
             gap: 12px;
         }
         .score-box {
-            background: var(--bg-elevated);
+            background: #020617;
             border-radius: 8px;
             padding: 8px 10px;
-            min-width: 140px;
-            border: 1px solid var(--border-subtle);
+            min-width: 120px;
+            border: 1px solid #1f2937;
         }
         .score-label {
-            font-size: 11px;
+            font-size: 12px;
             text-transform: uppercase;
-            color: var(--muted);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
+            color: #9ca3af;
         }
         .score-value {
             font-size: 16px;
             font-weight: 600;
-            margin-top: 2px;
         }
-        .score-level {
+        .score-sub {
             font-size: 11px;
-            padding: 1px 6px;
-            border-radius: 999px;
-            border: 1px solid transparent;
+            color: #6b7280;
         }
-        .level-none {
-            color: var(--muted);
-            border-color: transparent;
-        }
-        .level-potential {
-            color: var(--warning);
-            border-color: rgba(249, 115, 22, 0.4);
-        }
-        .level-emergency {
-            color: var(--danger);
-            border-color: rgba(239, 68, 68, 0.6);
-        }
-
         canvas {
-            background: var(--bg-elevated);
+            background: #020617;
             border-radius: 12px;
             padding: 12px;
-            border: 1px solid var(--border-subtle);
         }
-
-        /* Alerts column */
-        .panel {
-            background: var(--bg-alt);
+        #alerts-card {
+            background: #020617;
             border-radius: 12px;
-            border: 1px solid var(--border-subtle);
-            padding: 10px 12px;
+            padding: 12px;
+            border: 1px solid #1f2937;
+        }
+        #alert-banner {
+            padding: 8px 10px;
+            border-radius: 8px;
+            margin-bottom: 10px;
             font-size: 13px;
-            display: flex;
-            flex-direction: column;
-            min-height: 0;
         }
-        .panel-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 6px;
+        .alert-banner-normal {
+            background: #022c22;
+            color: #bbf7d0;
         }
-        .panel-title {
-            font-size: 13px;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.04em;
-            color: var(--muted);
+        .alert-banner-warning {
+            background: #451a03;
+            color: #fed7aa;
         }
-        .panel-body {
+        .alert-banner-emergency {
+            background: #450a0a;
+            color: #fecaca;
+        }
+        #alert-list {
+            max-height: 360px;
             overflow-y: auto;
-            max-height: 260px;
             padding-right: 4px;
+            font-size: 12px;
         }
-        .history-item {
-            padding: 6px 4px;
-            border-bottom: 1px solid rgba(31, 41, 55, 0.7);
+        .alert-item {
+            padding: 6px 8px;
+            border-radius: 8px;
+            margin-bottom: 6px;
+            border: 1px solid #1f2937;
         }
-        .history-item:last-child {
-            border-bottom: none;
+        .alert-level-warning {
+            border-color: #f97316;
         }
-        .history-meta {
+        .alert-level-emergency {
+            border-color: #ef4444;
+        }
+        .alert-time {
+            color: #9ca3af;
             font-size: 11px;
-            color: var(--muted);
-            margin-bottom: 2px;
         }
-        .history-main {
-            font-size: 13px;
+        .alert-msg {
+            margin-top: 2px;
         }
-
-        /* Log panel */
-        #logs-list {
-            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-            font-size: 11px;
-            color: #e5e7eb;
-        }
-        .log-line {
-            padding: 3px 0;
-            border-bottom: 1px solid rgba(31, 41, 55, 0.7);
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-
-        @media (max-width: 900px) {
-            #layout {
-                grid-template-columns: 1fr;
-                grid-template-areas:
-                  "main"
-                  "alerts"
-                  "logs";
-            }
+        .alert-meta {
+            margin-top: 2px;
+            color: #6b7280;
         }
     </style>
 </head>
 <body>
     <h1>Audio Emergency Monitor</h1>
     <div id="layout">
-        <div id="main-panel">
+        <div>
             <div id="top-bar">
                 <div>Active client: <span id="client-id">none</span></div>
                 <div id="status">Waiting for scores...</div>
-                <div id="overall-badge" class="badge badge-none">No signal</div>
             </div>
-            <div id="alert-banner">
-                <strong>🚨 Emergency detected</strong>
-                <span id="alert-banner-text"></span>
-            </div>
-
-            <canvas id="chart" height="120"></canvas>
+            <canvas id="chart" height="140"></canvas>
 
             <div id="scores-panel">
                 <div class="score-box">
-                    <div class="score-label">
-                        <span>Vocal distress</span>
-                        <span id="vocal-level" class="score-level level-none">none</span>
-                    </div>
+                    <div class="score-label">Vocal distress</div>
                     <div class="score-value" id="vocal-score">0.00</div>
+                    <div class="score-sub" id="vocal-sub"></div>
                 </div>
                 <div class="score-box">
-                    <div class="score-label">
-                        <span>Gunshot</span>
-                        <span id="gunshot-level" class="score-level level-none">none</span>
-                    </div>
+                    <div class="score-label">Gunshot</div>
                     <div class="score-value" id="gunshot-score">0.00</div>
+                    <div class="score-sub" id="gunshot-sub"></div>
                 </div>
                 <div class="score-box">
-                    <div class="score-label">
-                        <span>Alarm</span>
-                        <span id="alarm-level" class="score-level level-none">none</span>
-                    </div>
+                    <div class="score-label">Alarm</div>
                     <div class="score-value" id="alarm-score">0.00</div>
+                    <div class="score-sub" id="alarm-sub"></div>
                 </div>
                 <div class="score-box">
-                    <div class="score-label">
-                        <span>Explosion</span>
-                        <span id="explosion-level" class="score-level level-none">none</span>
-                    </div>
+                    <div class="score-label">Explosion</div>
                     <div class="score-value" id="explosion-score">0.00</div>
+                    <div class="score-sub" id="explosion-sub"></div>
                 </div>
                 <div class="score-box">
-                    <div class="score-label">
-                        <span>Emergency (rolling max)</span>
-                        <span class="score-level level-none" id="emergency-level-small">none</span>
-                    </div>
+                    <div class="score-label">Emergency (rolling max)</div>
                     <div class="score-value" id="emergency-score">0.00</div>
+                    <div class="score-sub" id="emergency-sub"></div>
                 </div>
             </div>
         </div>
 
-        <div id="alerts-panel" class="panel">
-            <div class="panel-header">
-                <div class="panel-title">Alert history</div>
-                <div id="alerts-count" style="font-size:11px;color:var(--muted);">0</div>
+        <div id="alerts-card">
+            <div id="alert-banner" class="alert-banner-normal">
+                No alerts yet
             </div>
-            <div class="panel-body" id="alerts-list">
-                <!-- alerts go here -->
+            <div style="font-size: 13px; margin-bottom: 6px; color: #9ca3af;">
+                Alert history
             </div>
-        </div>
-
-        <div id="logs-panel" class="panel">
-            <div class="panel-header">
-                <div class="panel-title">Model log</div>
-                <div style="font-size:11px;color:var(--muted);">Newest first</div>
-            </div>
-            <div class="panel-body" id="logs-list">
-                <!-- log lines go here -->
-            </div>
+            <div id="alert-list"></div>
         </div>
     </div>
 
@@ -466,12 +451,6 @@ async def dashboard():
             }
         };
 
-        // Alert + log state
-        let lastOverallLevel = "none";
-        let lastLogTimestamp = 0;
-        const MAX_ALERTS = 50;
-        const MAX_LOGS = 200;
-
         function initChart() {
             const ctx = document.getElementById('chart').getContext('2d');
             chart = new Chart(ctx, {
@@ -505,7 +484,7 @@ async def dashboard():
                             },
                             title: {
                                 display: true,
-                                text: 'Time (windows)',
+                                text: 'Time (seconds)',
                                 color: '#9ca3af',
                                 font: { size: 11 }
                             },
@@ -535,117 +514,6 @@ async def dashboard():
             });
         }
 
-        function setOverallBadge(level) {
-            const badge = document.getElementById('overall-badge');
-            badge.className = 'badge'; // reset
-            let text = '';
-
-            if (level === 'emergency') {
-                badge.classList.add('badge-emergency');
-                text = 'Emergency';
-            } else if (level === 'potential') {
-                badge.classList.add('badge-potential');
-                text = 'Potential risk';
-            } else {
-                badge.classList.add('badge-none');
-                text = 'No emergency detected';
-            }
-
-            badge.textContent = text;
-        }
-
-        function setLevelChip(elemId, level) {
-            const el = document.getElementById(elemId);
-            el.className = 'score-level';
-            if (level === 'emergency') {
-                el.classList.add('level-emergency');
-            } else if (level === 'potential') {
-                el.classList.add('level-potential');
-            } else {
-                el.classList.add('level-none');
-            }
-            el.textContent = level;
-        }
-
-        function showAlertBanner(text) {
-            const banner = document.getElementById('alert-banner');
-            const span = document.getElementById('alert-banner-text');
-            span.textContent = text || '';
-            banner.style.display = 'block';
-
-            // Auto-fade after 6 seconds
-            setTimeout(() => {
-                banner.style.display = 'none';
-            }, 6000);
-        }
-
-        function addAlertHistoryEntry(clientId, scores) {
-            const scoresRolling = scores.rolling || {};
-            const levels = scores.per_group_level || {};
-            const ts = scores.timestamp || Date.now() / 1000;
-            const date = new Date(ts * 1000);
-            const tsStr = date.toLocaleTimeString([], { hour12: false });
-
-            const v = (scoresRolling.vocal || 0).toFixed(3);
-            const g = (scoresRolling.gunshot || 0).toFixed(3);
-            const a = (scoresRolling.alarm || 0).toFixed(3);
-            const e = (scoresRolling.explosion || 0).toFixed(3);
-
-            const overall = scores.overall_level || 'emergency';
-
-            const item = document.createElement('div');
-            item.className = 'history-item';
-
-            item.innerHTML = `
-                <div class="history-meta">
-                    <span>${tsStr}</span>
-                    <span style="margin-left:6px;color:#a5b4fc;">${clientId}</span>
-                    <span style="margin-left:6px;">level: <strong>${overall}</strong></span>
-                </div>
-                <div class="history-main">
-                    vocal=${v} (${levels.vocal || 'none'}),
-                    gunshot=${g} (${levels.gunshot || 'none'}),
-                    alarm=${a} (${levels.alarm || 'none'}),
-                    explosion=${e} (${levels.explosion || 'none'})
-                </div>
-            `;
-
-            const list = document.getElementById('alerts-list');
-            // Newest on top
-            list.insertBefore(item, list.firstChild);
-
-            // Trim
-            while (list.children.length > MAX_ALERTS) {
-                list.removeChild(list.lastChild);
-            }
-
-            document.getElementById('alerts-count').textContent =
-                list.children.length.toString();
-        }
-
-        function addLogLine(scores) {
-            const logLine = scores.log_line;
-            const ts = scores.timestamp || Date.now() / 1000;
-            const list = document.getElementById('logs-list');
-
-            if (!logLine) return;
-
-            // Avoid duplicates by timestamp
-            if (ts <= lastLogTimestamp) return;
-            lastLogTimestamp = ts;
-
-            const div = document.createElement('div');
-            div.className = 'log-line';
-            div.textContent = logLine;
-
-            // Newest first
-            list.insertBefore(div, list.firstChild);
-
-            while (list.children.length > MAX_LOGS) {
-                list.removeChild(list.lastChild);
-            }
-        }
-
         async function pollScores() {
             try {
                 const res = await fetch('/scores');
@@ -659,26 +527,18 @@ async def dashboard():
                 if (clientIds.length === 0) {
                     document.getElementById('client-id').textContent = 'none';
                     document.getElementById('status').textContent = 'No active streams yet...';
-                    setOverallBadge('none');
                     return;
                 }
 
-                // For now: just take the first client
                 const clientId = clientIds[0];
-                const scores = data[clientId];
-
                 document.getElementById('client-id').textContent = clientId;
                 document.getElementById('status').textContent = 'Receiving live scores';
 
+                const scores = data[clientId];
                 const rolling = scores.rolling || {};
+                const rollingRaw = scores.rolling_raw || {};
                 const emergencyRolling = scores.emergency_rolling || 0.0;
-                const perGroupLevel = scores.per_group_level || {};
-                const overallLevel = scores.overall_level || 'none';
 
-                // Update overall badge
-                setOverallBadge(overallLevel);
-
-                // Update numeric display + per-group severity chips
                 const v = rolling.vocal || 0.0;
                 const g = rolling.gunshot || 0.0;
                 const a = rolling.alarm || 0.0;
@@ -690,13 +550,17 @@ async def dashboard():
                 document.getElementById('explosion-score').textContent = e.toFixed(3);
                 document.getElementById('emergency-score').textContent = emergencyRolling.toFixed(3);
 
-                setLevelChip('vocal-level', perGroupLevel.vocal || 'none');
-                setLevelChip('gunshot-level', perGroupLevel.gunshot || 'none');
-                setLevelChip('alarm-level', perGroupLevel.alarm || 'none');
-                setLevelChip('explosion-level', perGroupLevel.explosion || 'none');
-                setLevelChip('emergency-level-small', overallLevel);
+                document.getElementById('vocal-sub').textContent =
+                    'raw: ' + (rollingRaw.vocal || 0).toFixed(3);
+                document.getElementById('gunshot-sub').textContent =
+                    'raw: ' + (rollingRaw.gunshot || 0).toFixed(3);
+                document.getElementById('alarm-sub').textContent =
+                    'raw: ' + (rollingRaw.alarm || 0).toFixed(3);
+                document.getElementById('explosion-sub').textContent =
+                    'raw: ' + (rollingRaw.explosion || 0).toFixed(3);
+                document.getElementById('emergency-sub').textContent =
+                    'instant max: ' + (scores.emergency_instant || 0).toFixed(3);
 
-                // Append new point to chart
                 const t = labels.length > 0 ? labels[labels.length - 1] + 1 : 0;
                 labels.push(t);
                 datasets.vocal.data.push(v);
@@ -713,34 +577,72 @@ async def dashboard():
                 chart.data.labels = labels;
                 chart.update('none');
 
-                // Log line
-                addLogLine(scores);
-
-                // ALERT logic: trigger when we *enter* emergency
-                if (lastOverallLevel !== 'emergency' && overallLevel === 'emergency') {
-                    const top = scores.top_labels || [];
-                    const topText = top
-                        .slice(0, 3)
-                        .map(t => `${t.label}:${t.prob.toFixed(2)}`)
-                        .join(', ');
-
-                    showAlertBanner(topText || 'High emergency confidence');
-
-                    addAlertHistoryEntry(clientId, scores);
-                }
-                lastOverallLevel = overallLevel;
-
             } catch (err) {
                 console.error('Error in pollScores:', err);
                 document.getElementById('status').textContent = 'Error talking to server';
-                setOverallBadge('none');
+            }
+        }
+
+        function renderAlerts(alerts) {
+            const banner = document.getElementById('alert-banner');
+            const list = document.getElementById('alert-list');
+
+            if (!alerts || alerts.length === 0) {
+                banner.className = 'alert-banner-normal';
+                banner.textContent = 'No alerts yet';
+                list.innerHTML = '';
+                return;
+            }
+
+            const latest = alerts[alerts.length - 1];
+            banner.className =
+                latest.level === 'emergency'
+                    ? 'alert-banner-emergency'
+                    : 'alert-banner-warning';
+
+            banner.textContent =
+                '[' + latest.level.toUpperCase() + '] ' + latest.message;
+
+            list.innerHTML = alerts.slice().reverse().map(a => {
+                const ts = a.timestamp || '';
+                const lvl = a.level || 'normal';
+                const msg = a.message || '';
+                const em = (a.emergency_rolling || 0).toFixed(3);
+                const primaryGroup = (a.top_groups && a.top_groups.length > 0)
+                    ? a.top_groups[0][0] + '=' + a.top_groups[0][1].toFixed(2)
+                    : '';
+
+                const cls = lvl === 'emergency'
+                    ? 'alert-item alert-level-emergency'
+                    : 'alert-item alert-level-warning';
+
+                return `
+                    <div class="${cls}">
+                        <div class="alert-time">${ts} • ${lvl.toUpperCase()}</div>
+                        <div class="alert-msg">${msg}</div>
+                        <div class="alert-meta">
+                            emergency=${em} ${primaryGroup ? ' • ' + primaryGroup : ''}
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        async function pollAlerts() {
+            try {
+                const res = await fetch('/alerts');
+                if (!res.ok) return;
+                const data = await res.json();
+                renderAlerts(data.alerts || []);
+            } catch (err) {
+                console.error('Error in pollAlerts:', err);
             }
         }
 
         window.addEventListener('load', () => {
             initChart();
-            // Poll once per second; model updates once per audio window
             setInterval(pollScores, 1000);
+            setInterval(pollAlerts, 1000);
         });
     </script>
 </body>
